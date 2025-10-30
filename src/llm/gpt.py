@@ -48,11 +48,12 @@ class GPTModel(nn.Module):
             window=getattr(self.cfg, "sliding_window", None),
             sink=getattr(self.cfg, "attention_sink", 0),
         ) if self.cfg.use_kv_cache else None
-        
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.max_seq_len:]
-            logits = self(idx_cond, kv_cache=kv_cache)[:, -1, :]  # [B, vocab]
 
+        # 1) PREFILL: pass the full context once to fill the KV cache
+        idx = idx[:, -self.cfg.max_seq_len:]
+        logits = self(idx, kv_cache=kv_cache)[:, -1, :]  # cache is now filled, last logit obtained
+
+        for _ in range(max_new_tokens):
             # temperature
             if temperature != 1.0:
                 logits = logits / max(1e-8, temperature)
@@ -68,9 +69,9 @@ class GPTModel(nn.Module):
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
                 probs = torch.softmax(sorted_logits, dim=-1)
                 cumprobs = torch.cumsum(probs, dim=-1)
-                # mask tokens beyond
+                # mask tokens beyond top-p cumulative probability
                 mask = cumprobs > top_p
-                # keep first token even if > top_p
+                # always keep the first token even if it exceeds top_p
                 mask[:, 0] = False
                 sorted_logits = sorted_logits.masked_fill(mask, float('-inf'))
                 # restore original order
@@ -81,11 +82,13 @@ class GPTModel(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
 
-            # early-stopping    
-            if eos_id is not None:
-                if (next_id == eos_id).all():
-                    break
-        
+            # early stopping
+            if eos_id is not None and (next_id == eos_id).all():
+                break
+
+            # 2) DECODE: pass only the LAST token (T=1) for incremental generation
+            logits = self(idx[:, -1:], kv_cache=kv_cache)[:, -1, :]
+
         return idx
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, kv_cache: Optional[KVCache] = None):

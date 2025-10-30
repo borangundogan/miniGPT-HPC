@@ -84,7 +84,7 @@ def main():
         d_model=args.d_model,
         d_mlp=args.d_mlp,
         dropout=args.dropout,
-        use_rope=False,
+        use_rope=True,
         activation="gelu",
         norm_type="rmsnorm",
         use_kv_cache=True,
@@ -93,6 +93,7 @@ def main():
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
 
     # Optimizer + AMP
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)

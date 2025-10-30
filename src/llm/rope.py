@@ -11,6 +11,9 @@ def build_rope_cache(d_head: int, max_seq_len: int, device=None, base: float = 1
 
 # TODO: didnt work correctly ! 
 def apply_rope(x, cos, sin):
+    # print("[apply_rope] x.shape=", tuple(x.shape), 
+    #   "cos.shape=", tuple(cos.shape), "sin.shape=", tuple(sin.shape))
+
     # x: [B, T, n_head, d_head]
     T = x.size(1)
 

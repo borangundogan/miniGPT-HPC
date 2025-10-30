@@ -113,9 +113,17 @@ class CausalSelfAttention(nn.Module):
         if self.use_rope:
             self._maybe_build_rope(x.device)
             cos, sin = self._rope_cache
+
+            # dynamically extend if we need more positions
+            needed_len = Tprev + T
+            if needed_len > cos.size(0):
+                cos, sin = build_rope_cache(self.d_head, needed_len * 2, device=x.device)
+                self._rope_cache = (cos, sin)
+
             pos = slice(Tprev, Tprev + T)
             q = apply_rope(q, cos[pos], sin[pos])
             k = apply_rope(k, cos[pos], sin[pos])
+
 
         if cached is not None:
                 k_prev, v_prev = cached  # [B, Tprev, H_kv, D_kv]
