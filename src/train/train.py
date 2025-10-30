@@ -9,6 +9,8 @@ from llm import GPTConfig, GPTModel
 from tokenizer.tokenizer_wrapper import TokenizerWrapper
 from llm.corpus_dataset import CorpusDataset
 
+from lr_scheduler import WarmupCosineLR
+
 
 @torch.no_grad()
 def estimate_loss(model: GPTModel, dl_train, dl_val, device, eval_iters: int) -> dict:
@@ -99,6 +101,9 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
+    warmup_steps = int(0.05 * args.steps)
+    scheduler = WarmupCosineLR(opt, warmup_steps=warmup_steps, total_steps=args.steps, base_lr=args.lr)
+
     # Output directory under root /runs/
     out_dir = os.path.join("runs", os.path.basename(args.out_dir))
     os.makedirs(out_dir, exist_ok=True)
@@ -129,10 +134,11 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(opt)
         scaler.update()
+        current_lr = scheduler.step()
 
         step += 1
-        if step % 10 == 0:
-            print(f"step {step:5d} | loss {loss.item():.4f} | {time.time()-t0:.1f}s")
+        if step % 100 == 0:
+            print(f"step {step:5d} | loss {loss.item():.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
             t0 = time.time()
 
         # Eval + checkpoint
