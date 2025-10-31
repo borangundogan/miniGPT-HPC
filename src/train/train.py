@@ -1,14 +1,13 @@
 # src/train/train.py
 from __future__ import annotations
-import argparse, os, time, math
+import argparse, os, time, math, glob
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Optional
+from typing import Optional
 
 from llm import GPTConfig, GPTModel
 from tokenizer.tokenizer_wrapper import TokenizerWrapper
 from llm.corpus_dataset import CorpusDataset
-
 from lr_scheduler import WarmupCosineLR
 
 
@@ -16,28 +15,38 @@ from lr_scheduler import WarmupCosineLR
 def estimate_loss(model: GPTModel, dl_train, dl_val, device, eval_iters: int) -> dict:
     model.eval()
     out = {}
+
     def avg_loss(dloader):
         losses = []
-        it = 0
-        for x, y in dloader:
+        for it, (x, y) in enumerate(dloader):
             x, y = x.to(device), y.to(device)
             _, loss = model(x, y)
             losses.append(loss.item())
-            it += 1
             if it >= eval_iters:
                 break
         return sum(losses) / len(losses)
+
     out["train"] = avg_loss(dl_train)
-    out["val"]   = avg_loss(dl_val)
+    out["val"] = avg_loss(dl_val)
     model.train()
     return out
 
 
+def find_latest_checkpoint(out_dir: str) -> Optional[str]:
+    """Return the most recently modified checkpoint in a run directory."""
+    candidates = sorted(
+        glob.glob(os.path.join(out_dir, "model_*.pt")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, required=True, help="Path to text corpus file")
+    ap.add_argument("--data", type=str, required=True)
     ap.add_argument("--tok_model", type=str, default="data/tokenizer/hpc_bpe.model")
-    ap.add_argument("--out_dir", type=str, default="runs/default_run", help="Directory under /runs for checkpoints")
+    ap.add_argument("--out_dir", type=str, default="runs/default_run")
     ap.add_argument("--max_seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--n_layer", type=int, default=6)
@@ -64,20 +73,19 @@ def main():
     # Device setup
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else
-        ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() and not args.cpu else "cpu")
+        ("mps" if getattr(torch.backends, "mps", None)
+         and torch.backends.mps.is_available() and not args.cpu else "cpu")
     )
     print(f"Device: {device}")
 
-    # Tokenizer
+    # Tokenizer and datasets
     tokenizer = TokenizerWrapper(args.tok_model)
-
-    # Datasets
     ds_train = CorpusDataset(args.data, tokenizer, args.max_seq_len, split="train")
-    ds_val   = CorpusDataset(args.data, tokenizer, args.max_seq_len, split="val")
+    ds_val = CorpusDataset(args.data, tokenizer, args.max_seq_len, split="val")
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    dl_val   = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
-    # Model config
+    # Model configuration
     cfg = GPTConfig(
         vocab_size=tokenizer.vocab_size,
         max_seq_len=args.max_seq_len,
@@ -95,26 +103,41 @@ def main():
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    
 
-    # Optimizer + AMP
+    # Optimizer, scaler, scheduler
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
-
     warmup_steps = int(0.05 * args.steps)
     scheduler = WarmupCosineLR(opt, warmup_steps=warmup_steps, total_steps=args.steps, base_lr=args.lr)
 
-    # Output directory under root /runs/
+    # Output directory
     out_dir = os.path.join("runs", os.path.basename(args.out_dir))
     os.makedirs(out_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {out_dir}")
+
+    # Resume logic
+    resume_path = find_latest_checkpoint(out_dir)
+    start_step = 0
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=False)
+        print(f"🔁 Resumed from checkpoint: {resume_path}")
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                print("Could not load scheduler state; restarting LR schedule.")
+        start_step = ckpt.get("step", 0)
+        print(f"Resuming from step {start_step}")
 
     # Training loop
     best_val = float("inf")
     t0 = time.time()
     model.train()
-    step = 0
     train_iter = iter(dl_train)
+    step = start_step
 
     while step < args.steps:
         try:
@@ -124,9 +147,9 @@ def main():
             continue
 
         x, y = x.to(device), y.to(device)
-        with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+        with torch.amp.autocast(enabled=(args.amp and device.type == "cuda")):
             _, loss = model(x, y)
-            
+
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
@@ -135,34 +158,34 @@ def main():
         scaler.step(opt)
         scaler.update()
         current_lr = scheduler.step()
-
         step += 1
+
         if step % 100 == 0:
             print(f"step {step:5d} | loss {loss.item():.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
             t0 = time.time()
 
-        # Eval + checkpoint
+        # Evaluation and checkpoint
         if step % args.eval_interval == 0:
             scores = estimate_loss(model, dl_train, dl_val, device, args.eval_iters)
             print(f"eval | train {scores['train']:.4f} | val {scores['val']:.4f}")
             if scores["val"] < best_val:
                 best_val = scores["val"]
                 ckpt_path = os.path.join(out_dir, "model_best.pt")
-                torch.save({
+                ckpt = {
                     "model": model.state_dict(),
-                    "config": {
-                        "vocab_size": tokenizer.vocab_size,
-                        "max_seq_len": args.max_seq_len,
-                        "n_layer": args.n_layer,
-                        "n_head": args.n_head,
-                        "d_model": args.d_model,
-                        "d_mlp": args.d_mlp,
-                        "dropout": args.dropout,
-                    }
-                }, ckpt_path)
-                print(f"saved checkpoint: {ckpt_path}")
+                    "optimizer": opt.state_dict(),
+                    "step": step,
+                    "config": cfg.__dict__,
+                }
+                if hasattr(scheduler, "state_dict"):
+                    try:
+                        ckpt["scheduler"] = scheduler.state_dict()
+                    except Exception:
+                        print("Could not save scheduler state; skipping.")
+                torch.save(ckpt, ckpt_path)
+                print(f"Saved checkpoint: {ckpt_path}")
 
-        # Sample
+        # Periodic sample
         if args.sample_every > 0 and step % args.sample_every == 0:
             model.eval()
             with torch.no_grad():
@@ -180,10 +203,21 @@ def main():
                       "\n=======================================\n")
             model.train()
 
-    # Final save
+    # Final checkpoint
     final_path = os.path.join(out_dir, "model_final.pt")
-    torch.save({"model": model.state_dict()}, final_path)
-    print(f"✅ Saved final model: {final_path}")
+    final_ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "step": step,
+    }
+    if hasattr(scheduler, "state_dict"):
+        try:
+            final_ckpt["scheduler"] = scheduler.state_dict()
+        except Exception:
+            print("Could not save scheduler state; skipping.")
+    torch.save(final_ckpt, final_path)
+    print(f"Saved final model: {final_path}")
+
 
 if __name__ == "__main__":
     main()

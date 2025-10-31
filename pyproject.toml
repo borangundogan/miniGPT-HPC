@@ -9,4 +9,5 @@ dependencies = [
     "pypdf2>=3.0.1",
     "sentencepiece>=0.2.1",
     "torch>=2.9.0",
+    "trafilatura>=2.0.0",
 ]

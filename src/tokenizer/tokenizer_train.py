@@ -36,7 +36,7 @@ def train_tokenizer(
         max_sentence_length=max_sentence_length,
         input_sentence_size=input_sentence_size,
         shuffle_input_sentence=shuffle,
-        byte_fallback=True,         # ensures stable behavior for unseen symbols
+        byte_fallback=False,         # ensures stable behavior for unseen symbols
         hard_vocab_limit=False,     # allows flexible vocab adjustment
     )
 
