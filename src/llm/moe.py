@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch, torch.nn as nn
-from gating import TopKGate
-from experts import ExpertMLP
+from .gating import TopKGate
+from .experts import ExpertMLP
 
 class MoE(nn.Module):
     def __init__(self, dim: int, n_expert: int, k: int = 1, mult: int = 4, swiglu: bool = True, dropout: float = 0.0):

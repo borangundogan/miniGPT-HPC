@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .rope import build_rope_cache, apply_rope
-from moe import MoE
+from .moe import MoE
 
 
 class RMSNorm(nn.Module):
