@@ -28,13 +28,15 @@ class GPTConfig:
     # Init
     init_std: float = 0.02
 
-    n_kv_head: Optional[int] = None 
+    # Optional multi-query attention heads
+    n_kv_head: Optional[int] = None
 
+    # Sliding window attention
     sliding_window: Optional[int] = None
     attention_sink: int = 0
 
-    #MoE
-    use_hybrid_ffn: bool = True
-    hybrid_alpha: float = 0.5
-    n_expert: int = 4
-    k_expert: int = 1
+    use_moe: bool = False              # pure MoE mode
+    use_hybrid_ffn: bool = False       # hybrid dense + MoE mode
+    n_expert: int = 4                  # number of experts
+    k_expert: int = 1                  # top-k routing
+    alpha: float = 0.5                 # α blending for HybridFFN

@@ -19,7 +19,22 @@ class GPTModel(nn.Module):
 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_head, cfg.d_mlp, cfg.dropout, cfg.bias, cfg.norm_type, cfg.activation, cfg.use_rope, cfg.max_seq_len)
+            TransformerBlock(
+                d_model=cfg.d_model,
+                n_head=cfg.n_head,
+                d_mlp=cfg.d_mlp,
+                dropout=cfg.dropout,
+                bias=cfg.bias,
+                norm_type=cfg.norm_type,
+                activation=cfg.activation,
+                use_rope=cfg.use_rope,
+                max_seq_len=cfg.max_seq_len,
+                use_moe=cfg.use_moe,
+                use_hybrid_ffn=cfg.use_hybrid_ffn,
+                n_expert=cfg.n_expert,
+                k_expert=cfg.k_expert,
+                alpha=cfg.alpha,
+            )
             for _ in range(cfg.n_layer)
         ])
         self.ln_f = make_norm(cfg.d_model, cfg.norm_type)

@@ -33,7 +33,6 @@ def estimate_loss(model: GPTModel, dl_train, dl_val, device, eval_iters: int) ->
 
 
 def find_latest_checkpoint(out_dir: str) -> Optional[str]:
-    """Return the most recently modified checkpoint in a run directory."""
     candidates = sorted(
         glob.glob(os.path.join(out_dir, "model_*.pt")),
         key=os.path.getmtime,
@@ -68,9 +67,15 @@ def main():
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--use_moe", action="store_true")
+    ap.add_argument("--use_hybrid_ffn", action="store_true")
+    ap.add_argument("--n_expert", type=int, default=4)
+    ap.add_argument("--k_expert", type=int, default=1)
+    ap.add_argument("--alpha", type=float, default=0.5)
+    ap.add_argument("--lambda_aux", type=float, default=1e-2)
+
     args = ap.parse_args()
 
-    # Device setup
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else
         ("mps" if getattr(torch.backends, "mps", None)
@@ -78,14 +83,14 @@ def main():
     )
     print(f"Device: {device}")
 
-    # Tokenizer and datasets
     tokenizer = TokenizerWrapper(args.tok_model)
+
     ds_train = CorpusDataset(args.data, tokenizer, args.max_seq_len, split="train")
     ds_val = CorpusDataset(args.data, tokenizer, args.max_seq_len, split="val")
+
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
     dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
-    # Model configuration
     cfg = GPTConfig(
         vocab_size=tokenizer.vocab_size,
         max_seq_len=args.max_seq_len,
@@ -98,41 +103,37 @@ def main():
         activation="gelu",
         norm_type="rmsnorm",
         use_kv_cache=True,
+        use_moe=args.use_moe,
+        use_hybrid_ffn=args.use_hybrid_ffn,
+        n_expert=args.n_expert,
+        k_expert=args.k_expert,
+        alpha=args.alpha,
     )
     model = GPTModel(cfg).to(device)
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    # Optimizer, scaler, scheduler
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
     warmup_steps = int(0.05 * args.steps)
     scheduler = WarmupCosineLR(opt, warmup_steps=warmup_steps, total_steps=args.steps, base_lr=args.lr)
 
-    # Output directory
     out_dir = os.path.join("runs", os.path.basename(args.out_dir))
     os.makedirs(out_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {out_dir}")
 
-    # Resume logic
     resume_path = find_latest_checkpoint(out_dir)
     start_step = 0
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model"], strict=False)
-        print(f"🔁 Resumed from checkpoint: {resume_path}")
+        print(f"Resumed from checkpoint: {resume_path}")
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            except Exception:
-                print("Could not load scheduler state; restarting LR schedule.")
         start_step = ckpt.get("step", 0)
         print(f"Resuming from step {start_step}")
 
-    # Training loop
     best_val = float("inf")
     t0 = time.time()
     model.train()
@@ -147,8 +148,14 @@ def main():
             continue
 
         x, y = x.to(device), y.to(device)
-        with torch.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+        with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
             _, loss = model(x, y)
+
+            aux_loss = 0.0
+            for block in getattr(model, "blocks", []):
+                if hasattr(block, "last_aux_loss"):
+                    aux_loss += block.last_aux_loss
+            loss = loss + args.lambda_aux * aux_loss
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -164,7 +171,6 @@ def main():
             print(f"step {step:5d} | loss {loss.item():.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
             t0 = time.time()
 
-        # Evaluation and checkpoint
         if step % args.eval_interval == 0:
             scores = estimate_loss(model, dl_train, dl_val, device, args.eval_iters)
             print(f"eval | train {scores['train']:.4f} | val {scores['val']:.4f}")
@@ -177,44 +183,34 @@ def main():
                     "step": step,
                     "config": cfg.__dict__,
                 }
-                if hasattr(scheduler, "state_dict"):
-                    try:
-                        ckpt["scheduler"] = scheduler.state_dict()
-                    except Exception:
-                        print("Could not save scheduler state; skipping.")
                 torch.save(ckpt, ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}")
 
-        # Periodic sample
         if args.sample_every > 0 and step % args.sample_every == 0:
             model.eval()
             with torch.no_grad():
                 max_start = max(1, len(ds_train.ids) - args.max_seq_len - 1)
                 start = torch.randint(low=0, high=max_start, size=(1,)).item()
                 seed = ds_train.ids[start:start + args.max_seq_len].unsqueeze(0).to(device)
-                out = model.generate(seed,
-                                     max_new_tokens=args.sample_tokens,
-                                     temperature=args.temperature,
-                                     top_k=args.top_k,
-                                     top_p=args.top_p)
+                out = model.generate(
+                    seed,
+                    max_new_tokens=args.sample_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                )
                 txt = tokenizer.decode(out[0].tolist())
                 print("\n================ SAMPLE ================\n" +
                       txt[-(args.max_seq_len + args.sample_tokens):] +
                       "\n=======================================\n")
             model.train()
 
-    # Final checkpoint
     final_path = os.path.join(out_dir, "model_final.pt")
     final_ckpt = {
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),
         "step": step,
     }
-    if hasattr(scheduler, "state_dict"):
-        try:
-            final_ckpt["scheduler"] = scheduler.state_dict()
-        except Exception:
-            print("Could not save scheduler state; skipping.")
     torch.save(final_ckpt, final_path)
     print(f"Saved final model: {final_path}")
 
