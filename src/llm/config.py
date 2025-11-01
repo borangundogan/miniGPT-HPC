@@ -32,3 +32,9 @@ class GPTConfig:
 
     sliding_window: Optional[int] = None
     attention_sink: int = 0
+
+    #MoE
+    use_hybrid_ffn: bool = True
+    hybrid_alpha: float = 0.5
+    n_expert: int = 4
+    k_expert: int = 1
