@@ -168,8 +168,10 @@ def main():
         step += 1
 
         if step % 100 == 0:
-            print(f"step {step:5d} | loss {loss.item():.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
+            aux_val = aux_loss.item() if isinstance(aux_loss, torch.Tensor) else float(aux_loss)
+            print(f"step {step:5d} | main_loss {loss.item():.4f} | aux_loss {aux_val:.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
             t0 = time.time()
+
 
         if step % args.eval_interval == 0:
             scores = estimate_loss(model, dl_train, dl_val, device, args.eval_iters)
