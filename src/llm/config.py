@@ -16,7 +16,7 @@ class GPTConfig:
     bias: bool = False
 
     # Positional encoding
-    use_rope: bool = False   # if False, use learned positional embeddings
+    use_rope: bool = True   # if False, use learned positional embeddings
 
     # Norm / Act
     norm_type: str = "rmsnorm"   # "rmsnorm" | "layernorm"

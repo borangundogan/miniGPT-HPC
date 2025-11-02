@@ -1,42 +1,50 @@
+# src/tokenizer/tokenizer_wrapper.py
 from pathlib import Path
 import torch
-import sentencepiece as spm
+from tokenizers import Tokenizer
+
 
 class TokenizerWrapper:
-    """Utility wrapper around SentencePiece for easy encode/decode and batching."""
+    """
+    Wrapper for Hugging Face Byte-Level BPE tokenizer.
+    Supports encode/decode and batch tensorization.
+    """
 
-    def __init__(self, model_path: str):
-        self.sp = spm.SentencePieceProcessor()
-        self.sp.load(model_path)
+    def __init__(self, tokenizer_dir: str):
+        tokenizer_path = Path(tokenizer_dir)
+        if tokenizer_path.is_dir():
+            tokenizer_path = tokenizer_path / "tokenizer.json"
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(f"Tokenizer file not found: {tokenizer_path}")
 
-        # Special tokens
-        self.pad_id = 0
-        self.bos_id = 1
-        self.eos_id = 2
-        self.unk_id = 3 if self.sp.unk_id() == -1 else self.sp.unk_id()
+        self.tok = Tokenizer.from_file(str(tokenizer_path))
+        self.vocab_size = self.tok.get_vocab_size()
 
-        print(f"Loaded tokenizer from {model_path}")
+        self.pad_id = self.tok.token_to_id("<pad>") or 0
+        self.bos_id = self.tok.token_to_id("<s>") or 0
+        self.eos_id = self.tok.token_to_id("</s>") or 0
+        self.unk_id = self.tok.token_to_id("<unk>") or 0
+
+        if None in [self.pad_id, self.bos_id, self.eos_id, self.unk_id]:
+            raise ValueError("Didnt find special tokens ID!")
+
+        print(f"Loaded tokenizer from {tokenizer_path}")
         print(f"Vocab size: {self.vocab_size}")
 
-    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
-        """Encode a single text string into token IDs."""
-        ids = self.sp.encode(text, out_type=int)
+    def encode(self, text: str, add_special_tokens: bool = True):
+        ids = self.tok.encode(text).ids
         if add_special_tokens:
             return [self.bos_id] + ids + [self.eos_id]
         return ids
 
-    def decode(self, ids: list[int]) -> str:
-        """Decode token IDs back into text."""
-        return self.sp.decode(ids)
+    def decode(self, ids):
+        return self.tok.decode(ids)
 
-    def encode_batch(self, texts: list[str], max_length: int = 512) -> dict[str, torch.Tensor]:
-        """Encode and pad a batch of texts into tensors."""
+    def encode_batch(self, texts, max_length=512):
         encoded = [self.encode(t)[:max_length] for t in texts]
         max_len = max(len(x) for x in encoded)
 
-        input_ids = []
-        attention_mask = []
-
+        input_ids, attention_mask = [], []
         for seq in encoded:
             pad_len = max_len - len(seq)
             input_ids.append(seq + [self.pad_id] * pad_len)
@@ -47,11 +55,5 @@ class TokenizerWrapper:
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
 
-    def decode_batch(self, batch_ids: list[list[int]]) -> list[str]:
-        """Decode a batch of token ID sequences."""
+    def decode_batch(self, batch_ids):
         return [self.decode(ids) for ids in batch_ids]
-    
-    @property
-    def vocab_size(self) -> int:
-        """Return total vocabulary size from SentencePiece model."""
-        return self.sp.get_piece_size()

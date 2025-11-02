@@ -101,14 +101,13 @@ def test_gqa_shapes():
 
 
 def test_rope_start_pos():
-    # sadece implementasyonunda start_pos varsa
     torch.manual_seed(0)
     d_model, n_head, T, B = 64, 8, 8, 1
     attn = CausalSelfAttention(d_model, n_head, use_rope=True, max_seq_len=1024)
     x = torch.randn(B, T, d_model)
     try:
         y1 = attn(x)
-        y2 = attn(x)  # eğer start_pos parametresi varsa test edilebilir
+        y2 = attn(x) 
         print("RoPE start_pos smoke OK")
     except TypeError:
         print("start_pos parametresi bu versiyonda yok, test skip edildi.")

@@ -3,28 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .rope import build_rope_cache, apply_rope
+from .rope import RoPECache, apply_rope_single
 from .moe import MoE
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x):
-        norm_x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * norm_x
-
-
-def make_norm(d_model: int, norm_type: str):
-    if norm_type.lower() == "rmsnorm":
-        return RMSNorm(d_model)
-    elif norm_type.lower() == "layernorm":
-        return nn.LayerNorm(d_model)
-    else:
-        raise ValueError(f"Unknown norm_type: {norm_type}")
+from .rmsnorm import RMSNorm, make_norm
 
 
 class MLP(nn.Module):
@@ -89,11 +70,12 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
 
-        self._rope_cache = None
+        # RoPE cache object
+        self.rope_cache: Optional[RoPECache] = None
 
-    def _maybe_build_rope(self, device):
-        if self.use_rope and (self._rope_cache is None or self._rope_cache[0].device != device):
-            self._rope_cache = build_rope_cache(self.d_head, self.max_seq_len, device=device)
+    def _maybe_init_rope(self, device):
+        if self.use_rope and (self.rope_cache is None or self.rope_cache.device != device):
+            self.rope_cache = RoPECache(self.d_head, self.max_seq_len, device=device)
 
     def forward(self, x, kv_cache=None, layer_idx: Optional[int] = None):
         B, T, C = x.size()
@@ -103,30 +85,29 @@ class CausalSelfAttention(nn.Module):
 
         Tprev = 0
         cached = None
-        if kv_cache is not None and layer_idx is not None:
-            cached = kv_cache.get(layer_idx)
-            if cached is not None:
-                k_prev, v_prev = cached
-                Tprev = k_prev.size(1)
 
+        if kv_cache is not None and isinstance(kv_cache, tuple):
+            k_prev, v_prev = kv_cache
+            k_prev = k_prev.permute(0, 2, 1, 3)
+            v_prev = v_prev.permute(0, 2, 1, 3)
+            Tprev = k_prev.size(1)
+            cached = (k_prev, v_prev)
+
+        # Rotary embeddings
         if self.use_rope:
-            self._maybe_build_rope(x.device)
-            cos, sin = self._rope_cache
-            needed_len = Tprev + T
-            if needed_len > cos.size(0):
-                cos, sin = build_rope_cache(self.d_head, needed_len * 2, device=x.device)
-                self._rope_cache = (cos, sin)
-            pos = slice(Tprev, Tprev + T)
-            q = apply_rope(q, cos[pos], sin[pos])
-            k = apply_rope(k, cos[pos], sin[pos])
+            self._maybe_init_rope(x.device)
+            positions = torch.arange(Tprev, Tprev + T, device=x.device)
+            cos, sin = self.rope_cache.get(positions)
+            # apply_rope_single expects (B, H, T, D)
+            q = apply_rope_single(q.transpose(1, 2), cos, sin).transpose(1, 2)
+            k = apply_rope_single(k.transpose(1, 2), cos, sin).transpose(1, 2)
 
         if cached is not None:
             k_prev, v_prev = cached
             k = torch.cat([k_prev, k], dim=1)
             v = torch.cat([v_prev, v], dim=1)
 
-        if kv_cache is not None and layer_idx is not None:
-            kv_cache.append(layer_idx, k[:, -T:], v[:, -T:])
+        k_cache, v_cache = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -148,19 +129,22 @@ class CausalSelfAttention(nn.Module):
             Dh = q.size(-1)
             scores = (q @ k.transpose(-2, -1)) / (Dh ** 0.5)
             t_q, t_kv = scores.size(-2), scores.size(-1)
-            mask = torch.ones(t_q, t_kv, device=x.device, dtype=torch.bool)
-            scores = scores.masked_fill(~mask, float("-inf"))
+            i = torch.arange(t_q, device=x.device).unsqueeze(1)
+            j = torch.arange(t_kv, device=x.device).unsqueeze(0)
+            causal = j <= (Tprev + i)
+            scores = scores.masked_fill(~causal, float("-inf"))
             attn_prob = torch.softmax(scores, dim=-1)
+            if self.training and self.attn_drop.p > 0:
+                attn_prob = F.dropout(attn_prob, p=self.attn_drop.p)
             attn = attn_prob @ v
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
         out = self.proj(attn)
         out = self.resid_drop(out)
-        return out
+        return out, (k_cache, v_cache)
 
 
 class HybridFFN(nn.Module):
-    """Blend dense FFN with MoE output: y = α * Dense(x) + (1−α) * MoE(x)."""
     def __init__(
         self,
         dim: int,
@@ -195,6 +179,7 @@ class HybridFFN(nn.Module):
         y = self.alpha * y_dense + (1.0 - self.alpha) * y_moe
         return y, aux
 
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -212,12 +197,13 @@ class TransformerBlock(nn.Module):
         n_expert: int = 4,
         k_expert: int = 1,
         alpha: float = 0.5,
+        n_kv_head: Optional[int] = None,
     ):
         super().__init__()
         self.ln1 = make_norm(d_model, norm_type)
         self.attn = CausalSelfAttention(
             d_model, n_head, dropout=dropout, bias=bias,
-            use_rope=use_rope, max_seq_len=max_seq_len
+            use_rope=use_rope, max_seq_len=max_seq_len, n_kv_head=n_kv_head
         )
         self.ln2 = make_norm(d_model, norm_type)
 
@@ -245,12 +231,14 @@ class TransformerBlock(nn.Module):
         self.last_aux_loss = 0.0
 
     def forward(self, x, kv_cache=None, layer_idx: Optional[int] = None):
-        x = x + self.attn(self.ln1(x), kv_cache=kv_cache, layer_idx=layer_idx)
+        attn_out, new_kv = self.attn(self.ln1(x), kv_cache=kv_cache, layer_idx=layer_idx)
+        x = x + attn_out
+
         y = self.mlp(self.ln2(x))
         if isinstance(y, tuple):
             y, aux = y
-            self.last_aux_loss = aux
+            self.last_aux_loss = aux.mean() if torch.is_tensor(aux) else float(aux)
         else:
-            aux = 0.0
+            self.last_aux_loss = 0.0
         x = x + y
-        return x
+        return x, new_kv

@@ -1,9 +1,11 @@
+# src/llm/gpt.py
 from typing import Optional
 import torch
 import torch.nn as nn
 from .config import GPTConfig
 from .layers import TransformerBlock, make_norm
-from .kvcache import KVCache
+from .kvcache import KVCache, LayerwiseKV
+
 
 class GPTModel(nn.Module):
     def __init__(self, cfg: GPTConfig):
@@ -12,7 +14,6 @@ class GPTModel(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         if cfg.use_rope:
-            # RoPE replaces positional embeddings; keep a tiny learnable offset via bias-only PEs if desired later.
             self.pos_emb = None
         else:
             self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
@@ -40,8 +41,8 @@ class GPTModel(nn.Module):
         self.ln_f = make_norm(cfg.d_model, cfg.norm_type)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
-        # Weight tying
         self.lm_head.weight = self.tok_emb.weight
+        self.lm_head.weight.requires_grad = True
 
         self.apply(self._init_weights)
 
@@ -52,76 +53,83 @@ class GPTModel(nn.Module):
                 nn.init.zeros_(module.bias)
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int,
-                temperature: float = 1.0, top_k: Optional[int] = None,
-                top_p: Optional[float] = None,
-                eos_id: Optional[int] = None):
-        self.eval()
-
-        kv_cache = KVCache(
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
+        kv_cache = LayerwiseKV(
             self.cfg.n_layer,
-            window=getattr(self.cfg, "sliding_window", None),
-            sink=getattr(self.cfg, "attention_sink", 0),
+            window=self.cfg.sliding_window or self.cfg.max_seq_len,
+            sink=self.cfg.attention_sink,
         ) if self.cfg.use_kv_cache else None
 
-        # 1) PREFILL: pass the full context once to fill the KV cache
-        idx = idx[:, -self.cfg.max_seq_len:]
-        logits = self(idx, kv_cache=kv_cache)[:, -1, :]  # cache is now filled, last logit obtained
+        logits, new_kv_states = self(idx, kv_cache=kv_cache)
+        logits = logits[:, -1, :]
+
+        if kv_cache is not None:
+            for i, (k, v) in enumerate(new_kv_states):
+                kv_cache.append(i, k, v)
 
         for _ in range(max_new_tokens):
-            # temperature
+            logits, new_kv_states = self(idx[:, -1:], kv_cache=kv_cache)
+            logits = logits[:, -1, :]
+
             if temperature != 1.0:
-                logits = logits / max(1e-8, temperature)
-
-            # top-k
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                thresh = v[:, [-1]]
-                logits = torch.where(logits < thresh, torch.full_like(logits, float('-inf')), logits)
-
-            # top-p
-            if top_p is not None and 0.0 < top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                probs = torch.softmax(sorted_logits, dim=-1)
-                cumprobs = torch.cumsum(probs, dim=-1)
-                # mask tokens beyond top-p cumulative probability
-                mask = cumprobs > top_p
-                # always keep the first token even if it exceeds top_p
-                mask[:, 0] = False
-                sorted_logits = sorted_logits.masked_fill(mask, float('-inf'))
-                # restore original order
-                logits = torch.full_like(logits, float('-inf'))
-                logits.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
-
+                logits /= temperature
             probs = torch.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+
+            if top_k:
+                v, topk_idx = torch.topk(probs, min(top_k, probs.size(-1)))
+                probs = probs.masked_fill(probs < v[:, [-1]], 0.0)
+            if top_p:
+                sorted_p, sort_idx = torch.sort(probs, descending=True)
+                cum_p = torch.cumsum(sorted_p, dim=-1)
+                mask = cum_p > top_p
+                mask[:, 0] = False
+                sorted_p = sorted_p.masked_fill(mask, 0.0)
+                probs = torch.zeros_like(probs).scatter(-1, sort_idx, sorted_p)
+
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+            next_id = torch.multinomial(probs, 1)
+
             idx = torch.cat([idx, next_id], dim=1)
 
-            # early stopping
-            if eos_id is not None and (next_id == eos_id).all():
-                break
-
-            # 2) DECODE: pass only the LAST token (T=1) for incremental generation
-            logits = self(idx[:, -1:], kv_cache=kv_cache)[:, -1, :]
+            if kv_cache is not None:
+                for i, (k, v) in enumerate(new_kv_states):
+                    kv_cache.append(i, k, v)
 
         return idx
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, kv_cache: Optional[KVCache] = None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ):
         B, T = idx.shape
         assert T <= self.cfg.max_seq_len, f"Sequence length {T} exceeds max_seq_len {self.cfg.max_seq_len}"
-        x = self.tok_emb(idx)  # [B,T,C]
+
+        x = self.tok_emb(idx)
+
         if self.pos_emb is not None:
             pos = torch.arange(0, T, device=idx.device)
             x = x + self.pos_emb(pos)[None, :, :]
+
         x = self.drop(x)
+        new_kv_states = [] if kv_cache is not None else None
 
         for i, block in enumerate(self.blocks):
-            x = block(x, kv_cache=kv_cache, layer_idx=i if kv_cache is not None else None)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)  # [B,T,V]
+            layer_kv_cache = kv_cache.get(i) if kv_cache is not None else None
+            x, new_layer_kv = block(x, kv_cache=layer_kv_cache, layer_idx=i)
+            if kv_cache is not None:
+                new_kv_states.append(new_layer_kv)
 
-        if targets is None:
-            return logits
-        # Causal LM loss
-        loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is not None:
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
+            return logits, loss
+
+        return logits, new_kv_states

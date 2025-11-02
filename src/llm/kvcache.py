@@ -1,58 +1,71 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+from typing import Optional
 import torch
 
 
 class KVCache:
-    """
-    Layer-wise KV cache.
-    - Default: append-only (growing) cache.
-    - Optional rolling mode: keep first `sink` tokens + last `window` tokens (per layer),
-      which bounds memory and compute to O(window + sink).
-    """
-    def __init__(self, n_layer: int, window: Optional[int] = None, sink: int = 0):
-        self.keys = [None] * n_layer
-        self.values = [None] * n_layer
-        self.window = window          # if None => no rolling, grow indefinitely
-        self.sink = int(sink) if sink is not None else 0
+    """Simple container for a single layer's KV tensors."""
+    def __init__(self, k: torch.Tensor, v: torch.Tensor):
+        self.k = k  # shape: (B, H, T, D)
+        self.v = v  # shape: (B, H, T, D)
 
-    def get(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        k, v = self.keys[layer_idx], self.values[layer_idx]
-        if k is None or v is None:
+    @property
+    def T(self):
+        return self.k.size(2)
+
+
+class RollingKV:
+    """Rolling buffer for a single attention layer.
+    Keeps first `sink` tokens and last `window` tokens.
+    """
+    def __init__(self, window: int, sink: int = 0):
+        self.window = window
+        self.sink = sink
+        self.k = None
+        self.v = None
+
+    def step(self, k_new: torch.Tensor, v_new: torch.Tensor):
+        """Append new keys/values and crop to window size if needed."""
+        if self.k is None:
+            self.k, self.v = k_new, v_new
+        else:
+            # append along time dimension (dim=2)
+            self.k = torch.cat([self.k, k_new], dim=2)
+            self.v = torch.cat([self.v, v_new], dim=2)
+
+        # crop if exceeds (window + sink)
+        if self.k.size(2) > self.window + self.sink:
+            sink_k = self.k[:, :, : self.sink, :] if self.sink > 0 else None
+            sink_v = self.v[:, :, : self.sink, :] if self.sink > 0 else None
+            tail_k = self.k[:, :, -self.window :, :]
+            tail_v = self.v[:, :, -self.window :, :]
+
+            if self.sink > 0:
+                self.k = torch.cat([sink_k, tail_k], dim=2)
+                self.v = torch.cat([sink_v, tail_v], dim=2)
+            else:
+                self.k, self.v = tail_k, tail_v
+
+        return self.k, self.v
+
+
+class LayerwiseKV:
+    """Layer-wise KV cache wrapper for multi-layer GPT models."""
+    def __init__(self, n_layer: int, window: int, sink: int = 0):
+        self.layers = [RollingKV(window, sink) for _ in range(n_layer)]
+
+    def get(self, layer_idx: int):
+        kv = self.layers[layer_idx]
+        if kv.k is None or kv.v is None:
             return None
-        return k, v
+        return kv.k, kv.v
 
     @torch.no_grad()
     def append(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor):
-        # k_new/v_new shape: [B, T_new, H, Dh]
-        k_prev, v_prev = self.keys[layer_idx], self.values[layer_idx]
-        if k_prev is None:
-            k_cat, v_cat = k_new, v_new
-        else:
-            # concat along time dimension
-            k_cat = torch.cat([k_prev, k_new], dim=1)
-            v_cat = torch.cat([v_prev, v_new], dim=1)
-
-        # rolling crop if enabled
-        if self.window is not None:
-            T = k_cat.size(1)
-            keep = self.window + self.sink
-            if T > keep:
-                sink_k = k_cat[:, : self.sink] if self.sink > 0 else None
-                sink_v = v_cat[:, : self.sink] if self.sink > 0 else None
-                tail_k = k_cat[:, -self.window :] if self.window > 0 else None
-                tail_v = v_cat[:, -self.window :] if self.window > 0 else None
-
-                if self.sink > 0 and self.window > 0:
-                    k_cat = torch.cat([sink_k, tail_k], dim=1)
-                    v_cat = torch.cat([sink_v, tail_v], dim=1)
-                elif self.sink > 0:
-                    k_cat, v_cat = sink_k, sink_v
-                else:
-                    k_cat, v_cat = tail_k, tail_v
-
-        self.keys[layer_idx] = k_cat
-        self.values[layer_idx] = v_cat
+        """Append new K,V for a given layer."""
+        return self.layers[layer_idx].step(k_new, v_new)
 
     def clear(self):
-        for i in range(len(self.keys)):
-            self.keys[i], self.values[i] = None, None
+        """Reset all layers' caches."""
+        for kv in self.layers:
+            kv.k, kv.v = None, None

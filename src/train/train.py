@@ -22,7 +22,7 @@ def estimate_loss(model: GPTModel, dl_train, dl_val, device, eval_iters: int) ->
             x, y = x.to(device), y.to(device)
             _, loss = model(x, y)
             losses.append(loss.item())
-            if it >= eval_iters:
+            if it + 1 >= eval_iters:
                 break
         return sum(losses) / len(losses)
 
@@ -44,7 +44,7 @@ def find_latest_checkpoint(out_dir: str) -> Optional[str]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, required=True)
-    ap.add_argument("--tok_model", type=str, default="data/tokenizer/hpc_bpe.model")
+    ap.add_argument("--tok_model", type=str, default="data/tokenizer/tokenizer.json")
     ap.add_argument("--out_dir", type=str, default="runs/default_run")
     ap.add_argument("--max_seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=32)
@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--eval_interval", type=int, default=200)
     ap.add_argument("--eval_iters", type=int, default=50)
+    ap.add_argument("--use_rope", action="store_true", help="Use Rotary Positional Embeddings")
+    ap.add_argument("--use_kv_cache", action="store_true", help="Use KV Cache during generation")
     ap.add_argument("--sample_every", type=int, default=200)
     ap.add_argument("--sample_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -99,10 +101,10 @@ def main():
         d_model=args.d_model,
         d_mlp=args.d_mlp,
         dropout=args.dropout,
-        use_rope=True,
+        use_rope=args.use_rope,
+        use_kv_cache=args.use_kv_cache,
         activation="gelu",
         norm_type="rmsnorm",
-        use_kv_cache=True,
         use_moe=args.use_moe,
         use_hybrid_ffn=args.use_hybrid_ffn,
         n_expert=args.n_expert,
@@ -148,18 +150,22 @@ def main():
             continue
 
         x, y = x.to(device), y.to(device)
-        with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
-            _, loss = model(x, y)
+        use_autocast = (args.amp and device.type == "cuda")
 
-            aux_loss = 0.0
+        with torch.cuda.amp.autocast(enabled=use_autocast):
+            _, base_loss = model(x, y)
+            aux_loss = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
             for block in getattr(model, "blocks", []):
                 if hasattr(block, "last_aux_loss"):
-                    aux_loss += block.last_aux_loss
-            loss = loss + args.lambda_aux * aux_loss
+                    aux_loss = aux_loss + block.last_aux_loss.to(base_loss.dtype)
+            main_loss_val = base_loss.detach().item()
+            aux_val = aux_loss.detach().item()
+            loss = base_loss + args.lambda_aux * aux_loss
+            total_loss_val = loss.detach().item()
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
-        if args.grad_clip > 0:
+        if args.grad_clip > 0 and scaler.is_enabled():
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(opt)
@@ -168,10 +174,13 @@ def main():
         step += 1
 
         if step % 100 == 0:
-            aux_val = aux_loss.item() if isinstance(aux_loss, torch.Tensor) else float(aux_loss)
-            print(f"step {step:5d} | main_loss {loss.item():.4f} | aux_loss {aux_val:.4f} | lr {current_lr:.6f} | {time.time()-t0:.1f}s")
+            print(
+                f"step {step:5d} | main_loss {main_loss_val:.4f} "
+                f"| aux_loss {aux_val:.4f} "
+                f"| total_loss {total_loss_val:.4f} "
+                f"| lr {current_lr:.6f} | {time.time()-t0:.1f}s"
+            )
             t0 = time.time()
-
 
         if step % args.eval_interval == 0:
             scores = estimate_loss(model, dl_train, dl_val, device, args.eval_iters)

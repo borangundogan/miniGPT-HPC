@@ -1,34 +1,47 @@
+from __future__ import annotations
 import torch
 
-def build_rope_cache(d_head: int, max_seq_len: int, device=None, base: float = 10000.0):
-    #  ROPE (cos, sin) precomputed for speed
-    theta = 1.0 / (base ** (torch.arange(0, d_head, 2, device=device).float() / d_head))
-    pos = torch.arange(0, max_seq_len, device=device).float()
-    idx = torch.outer(pos, theta)  # [T, d_head/2]
-    cos = torch.cos(idx).repeat_interleave(2, dim=-1)  # [T, d_head]
-    sin = torch.sin(idx).repeat_interleave(2, dim=-1)  # [T, d_head]
-    return cos, sin
-
-# TODO: didnt work correctly ! 
-def apply_rope(x, cos, sin):
-    # print("[apply_rope] x.shape=", tuple(x.shape), 
-    #   "cos.shape=", tuple(cos.shape), "sin.shape=", tuple(sin.shape))
-
-    # x: [B, T, n_head, d_head]
-    T = x.size(1)
-
-    if T == 0:
-        return x
+class RoPECache:
+    """Precompute cos/sin for positions up to max_pos for even head_dim."""
+    def __init__(self, head_dim: int, max_pos: int, base: float = 10000.0, device: torch.device | None = None):
+        assert head_dim % 2 == 0, "RoPE head_dim must be even"
+        self.head_dim = head_dim
+        self.base = base
+        self.device = device
+        self._build(max_pos)
+    def get(self, positions: torch.Tensor):
+        # positions: (T,) or (1,T)
+        if positions.dim() == 2:
+            positions = positions[0]
+        need = int(positions.max().item()) + 1 if positions.numel() > 0 else 1
+        if need > self.max_pos:
+            # grow tables
+            self._build(max(need, int(self.max_pos * 2)))
+        cos = self.cos[positions]  # (T, D/2)
+        sin = self.sin[positions]
+        return cos, sin
     
-    if cos.size(0) < T:
-        # pad the cos/sin if they're shorter than current sequence length
-        pad = T - cos.size(0)
-        cos = torch.cat([cos, cos[-1:].repeat(pad, 1)], dim=0)
-        sin = torch.cat([sin, sin[-1:].repeat(pad, 1)], dim=0)
+    def _build(self, max_pos: int):
+        """(Re)build cos/sin tables for a new max_pos."""
+        self.max_pos = max_pos
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, device=self.device).float() / self.head_dim))
+        t = torch.arange(max_pos, device=self.device).float()
+        freqs = torch.outer(t, inv_freq)  # (max_pos, head_dim/2)
+        self.cos = torch.cos(freqs)
+        self.sin = torch.sin(freqs)
 
-    x1, x2 = x[..., ::2], x[..., 1::2]
-    x_rot = torch.stack((-x2, x1), dim=-1).reshape_as(x)
-    cos_b = cos[None, :T, None, :]
-    sin_b = sin[None, :T, None, :]
-    return x * cos_b + x_rot * sin_b
-
+def apply_rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate pairs along last dim for RoPE.
+    x: (B,H,T,D) with D even; cos/sin: (T,D/2)
+    """
+    assert x.size(-1) % 2 == 0
+    cos = cos.unsqueeze(0).unsqueeze(0)  # (1,1,T,D/2)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    xr1 = x1 * cos - x2 * sin
+    xr2 = x1 * sin + x2 * cos
+    out = torch.empty_like(x)
+    out[..., ::2] = xr1
+    out[..., 1::2] = xr2
+    return out
