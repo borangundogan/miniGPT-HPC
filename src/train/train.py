@@ -157,11 +157,15 @@ def main():
             aux_loss = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
             for block in getattr(model, "blocks", []):
                 if hasattr(block, "last_aux_loss"):
-                    aux_loss = aux_loss + block.last_aux_loss.to(base_loss.dtype)
-            main_loss_val = base_loss.detach().item()
-            aux_val = aux_loss.detach().item()
+                    val = torch.as_tensor(block.last_aux_loss, device=base_loss.device, dtype=base_loss.dtype)
+                    aux_loss += val
+        
+            main_loss_val = float(base_loss.detach().item())
+            aux_val = float(aux_loss.detach().item())
+
             loss = base_loss + args.lambda_aux * aux_loss
-            total_loss_val = loss.detach().item()
+            total_loss_val = float(loss.detach().item())
+
 
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
