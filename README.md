@@ -1,17 +1,23 @@
-# 🧠 HPC-LM: Domain-Specific LLM for High-Performance Computing
+# HPC-LM — Domain-Specific GPT for High-Performance Computing
 
-HPC-LM is an end-to-end playground for building a compact GPT-style language model tailored to high-performance computing (HPC). It covers the full pipeline: collecting domain documents, producing a tokenizer, implementing the transformer, and training/evaluating the resulting model.
+HPC-LM v2 is an end-to-end framework for training compact GPT-style language models specialized in High-Performance Computing (HPC) texts such as OpenMP, MPI, CUDA, and NUMA documentation.
+It now supports Rotary Positional Embeddings, Mixture-of-Experts (MoE) layers, Hybrid Feed-Forward Networks, and KV-Cache for fast inference.
 
 ## Highlights
-- Turn raw HPC lecture notes, manuals, and PDFs into a clean text corpus.
-- Train a SentencePiece BPE tokenizer tuned for HPC jargon (OpenMP, NUMA, vectorization, ...).
-- Build and train a GPT architecture with rotary positional embeddings and KV caching.
-- Validate the stack with lightweight unit tests and simple smoke runs.
+- Transform HPC lecture notes, manuals, and PDFs into a clean training corpus.
+- Train a Byte-Level BPE tokenizer tuned for HPC jargon.
+- Build and train a GPT architecture with:
+  - Rotary Positional Embeddings (RoPE)
+  - Mixture-of-Experts (MoE) & Hybrid FFN
+  - KV-Cache for efficient generation
+  - Mixed Precision (AMP) and `torch.compile` acceleration
+- Evaluate & sample during training with real-time text outputs.
 
 ## Prerequisites
-- Python 3.10+ (managed via [`uv`](https://github.com/astral-sh/uv)).
-- Populated `data/corpus/` directory with timestamped text files (see pipeline below).
-- Compute with CUDA if you plan to train larger models (not required for running scripts).
+- Python 3.10+
+- PyTorch 2.1+ (CUDA / MPS / CPU supported)
+- `uv` for environment management → [astral-sh/uv](https://github.com/astral-sh/uv)
+- Prepared corpus under `data/corpus/`
 
 ## Quickstart
 1. **Install dependencies**
@@ -19,65 +25,127 @@ HPC-LM is an end-to-end playground for building a compact GPT-style language mod
    uv sync
    ```
 
-2. **Extract and normalize text**
+2. **Prepare corpus**
    ```bash
    PYTHONPATH=src uv run python src/data_extractor/data_extractor.py
    PYTHONPATH=src uv run python src/data_extractor/corpus_prepare.py
    uv run python src/data_extractor/shuffle_corpus.py --input data/corpus/hpc_corpus_YYYYMMDD_HHMMSS.txt
-   uv run python src/data_extractor/split_corpus.py --input data/corpus/hpc_corpus_YYYYMMDD_HHMMSS_shuffled.txt
    ```
-   Replace the timestamp placeholders with the files generated in the previous step. The scripts produce train/test/eval splits under `data/corpus/`.
 
-3. **Train the tokenizer**
+3. **Train tokenizer (Hugging Face BPE)**
    ```bash
-   uv run python src/tokenizer/tokenizer_train.py
+   uv run python src/tokenizer/tokenizer_train.py \
+     --input data/corpus/hpc_corpus_clean.txt \
+     --output_dir data/tokenizer \
+     --vocab_size 8000
    ```
-   SentencePiece artifacts (`.model`, `.vocab`) are written to `data/tokenizer/`.
+   Artifacts: `tokenizer.json`, `vocab.json`, `merges.txt`
 
 4. **Launch training**
-   ```bash
-   PYTHONPATH=src uv run python src/train/train.py \
-     --data data/corpus/hpc_corpus_YYYYMMDD_HHMMSS_shuffled.txt \
-     --tok_model data/tokenizer/hpc_bpe.model \
-     --out_dir runs/hpc_baseline \
-     --max_seq_len 256 --batch_size 32 --n_layer 6 --n_head 8 --d_model 512
-   ```
-   Adjust CLI flags to match your experiment: learning rate, number of steps, sampling cadence, etc.
 
-5. **Run the smoke test**
+   Example: full-feature MoE + RoPE + KV Cache + AMP
    ```bash
-   PYTHONPATH=src uv run python src/test/tokenizer_wrapper_test.py
+   PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 uv run python src/train/train.py \
+     --data data/corpus/hpc_corpus_clean.txt \
+     --tok_model data/tokenizer/ \
+     --out_dir runs/hpc_moe_rope_v2 \
+     --max_seq_len 256 \
+     --batch_size 16 \
+     --steps 8000 \
+     --dropout 0.1 \
+     --lr 3e-4 \
+     --eval_interval 500 \
+     --sample_every 500 \
+     --use_rope \
+     --use_kv_cache \
+     --use_moe \
+     --use_hybrid_ffn \
+     --n_expert 6 \
+     --k_expert 2 \
+     --alpha 0.5 \
+     --lambda_aux 5e-3 \
+     --amp \
+     --compile
    ```
-   Confirms that encoding/decoding and attention masks align with what the training loop expects.
 
-6. **Generate text from a checkpoint**
-   ```bash
-   PYTHONPATH=src uv run python test.py \
-     --ckpt runs/hpc_baseline/model_best.pt \
-     --tok_model data/tokenizer/hpc_bpe_large_clean.model \
-     --prompt "In modern supercomputers, the OpenMP parallel region" \
-     --max_new_tokens 80
-   ```
-   Swap `--ckpt`, `--tok_model`, and the prompt to match your experiment. Optional flags `--temperature`, `--top_p`, and `--top_k` control sampling.
+## Model features
+
+| Feature | Flag | Status |
+| --- | --- | --- |
+| Rotary Positional Embedding | `--use_rope` | ✅ |
+| Mixture of Experts | `--use_moe` | ✅ |
+| Hybrid FFN (Dense + MoE) | `--use_hybrid_ffn` | ✅ |
+| KV-Cache (faster generation) | `--use_kv_cache` | ✅ |
+| AMP / FP16 | `--amp` | ✅ |
+| Torch Compile | `--compile` | ✅ |
+
+5. **Evaluate and generate samples**
+
+During training, samples are periodically printed:
+```
+================ SAMPLE ================
+In modern supercomputers, the OpenMP parallel region
+enables threads to share memory and synchronize barriers
+...
+=======================================
+```
+
+6. **Inference (text generation)**
+```bash
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python src/test/test.py \
+  --ckpt runs/hpc_moe_rope_v2/model_best.pt \
+  --tok_model data/tokenizer/ \
+  --prompt "In modern supercomputers, the OpenMP parallel region" \
+  --max_new_tokens 120 \
+  --temperature 0.8 \
+  --top_p 0.95 \
+  --top_k 50 \
+  --use_kv_cache 1
+```
+
+Example output:
+```
+=== MODEL OUTPUT ===
+In modern supercomputers, the OpenMP parallel region allows
+threads to execute concurrently across shared memory systems...
+[Generation time: 1.9 s | KV cache = ON]
+```
 
 ## Troubleshooting
-- **Null characters in corpus:** clean the offending file before downstream steps:
-  ```bash
-  cat data/corpus/hpc_corpus_20251028_204036_shuffled.txt | tr -d '\000-\010\013\014\016-\037' > data/corpus/hpc_corpus_clean.txt
-  ```
+| Issue | Fix |
+| --- | --- |
+| Size mismatch when resuming | Change `--out_dir` or match `--n_expert`, `--k_expert` to checkpoint. |
+| Aux loss not decreasing | Ensure `last_aux_loss` stays a `Tensor` (no `.item()` in `MoE.forward()`). |
+| AMP deprecation warnings | Replace `torch.cuda.amp.autocast` with `torch.amp.autocast('cuda')`. |
+| Slow generation | Use `--use_kv_cache 1` and run on GPU. |
 
-## Directory Layout
-- `data/corpus/` – cleaned corpora (timestamped text files and splits).
-- `data/tokenizer/` – tokenizer artifacts generated by `tokenizer_train.py`.
-- `src/data_extractor/` – scrapers, parsers, and corpus preparation utilities.
-- `src/tokenizer/` – tokenizer trainer (`tokenizer_train.py`) and runtime wrapper.
-- `src/llm/` – core model implementation (`gpt.py`, attention layers, rotary embeddings, KV cache).
-- `src/train/train.py` – CLI for model training, evaluation, and checkpointing.
-- `src/test/` – unit tests such as `tokenizer_wrapper_test.py`.
-- `runs/` – default output directory for checkpoints, logs, and sample generations.
-- `test.py` – quick script to load a checkpoint and generate text.
+## 📂 Directory layout
+```
+data/
+ ├─ corpus/       # cleaned + split text data
+ ├─ tokenizer/    # tokenizer artifacts
+src/
+ ├─ data_extractor/
+ ├─ tokenizer/
+ ├─ llm/          # GPT core (gpt.py, layers, rope, moe, rmsnorm, kvcache)
+ ├─ train/        # training loop (train.py)
+ └─ test/         # evaluation scripts
+runs/
+ └─ <experiment>/ # checkpoints + logs + samples
+test.py           # quick inference script
+```
 
-## Generated Artifacts
-- **Tokenizer assets:** cached under `data/tokenizer/` and reusable across runs.
-- **Model checkpoints:** stored in `runs/<experiment>/` (`model_best.pt`, `model_final.pt`) with minimal metadata.
-- **Sample generations:** emitted during training to monitor model quality in real time.
+## Artifacts
+| Type | Location |
+| --- | --- |
+| Tokenizer | `data/tokenizer/tokenizer.json`, `vocab.json`, `merges.txt` |
+| Checkpoints | `runs/<exp>/model_best.pt`, `model_final.pt` |
+| Samples | Printed or saved under run directory |
+| Logs | CLI progress with loss / aux_loss / sample text |
+
+## Example metrics (small run)
+| Step | main_loss | aux_loss | val_loss | Sample |
+| --- | --- | --- | --- | --- |
+| 200 | 5.06 | 6.04 | 4.61 | noisy text |
+| 1000 | 3.40 | 6.01 | 3.57 | structured phrases |
+| 4000 | 2.95 | 1.87 | 3.10 | coherent HPC sentences |
